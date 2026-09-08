@@ -33,3 +33,5 @@ Thumbs.db
 
 # Secrets
 secrets/
+# Pipeline test artifacts
+.pipeline-*.txt
