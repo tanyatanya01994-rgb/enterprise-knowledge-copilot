@@ -1,8 +1,4 @@
-"""UI-only presentation helpers.
 
-These functions deliberately operate on copies/strings at the display edge.
-They must never be used before embedding, retrieval, verification, or storage.
-"""
 
 from __future__ import annotations
 
