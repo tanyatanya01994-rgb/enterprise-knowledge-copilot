@@ -1,148 +1,62 @@
+"""Conversation-aware query rewriting with a safe local fallback."""
+
+from __future__ import annotations
+
 import os
+import re
+from collections.abc import Sequence
+
 from dotenv import load_dotenv
 from google import genai
 
-
-# ---------------------------------------------------------
-# Load environment variables
-# ---------------------------------------------------------
-
 load_dotenv()
-
-API_KEY = os.getenv("GEMINI_API_KEY")
-
-if not API_KEY:
-    raise ValueError(
-        "GEMINI_API_KEY is not set in the .env file."
-    )
+MODELS = ("gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.8-flash")
+MAX_HISTORY_TURNS = 8
 
 
-# ---------------------------------------------------------
-# Create Gemini client
-# ---------------------------------------------------------
-
-client = genai.Client(api_key=API_KEY)
+def _recent_history(history: Sequence[str] | None) -> list[str]:
+    return [str(item).strip() for item in (history or []) if str(item).strip()][-MAX_HISTORY_TURNS:]
 
 
-# ---------------------------------------------------------
-# Available models
-# ---------------------------------------------------------
+def _local_rewrite(query: str, history: Sequence[str]) -> str:
+    """Resolve only an explicit follow-up reference; otherwise leave the query intact."""
+    query = query.strip()
+    if not history or not re.search(r"\b(it|they|them|that|those)\b|^what about\b", query.lower()):
+        return query
+    previous = [line.split(":", 1)[1].strip() for line in history if line.lower().startswith("user:")]
+    if not previous:
+        return query
+    topic = previous[-1]
+    if query.lower().startswith("what about"):
+        subject = query[len("what about"):].strip(" ?.")
+        return f"{topic} Specifically, how does it apply to {subject}?" if subject else topic
+    return f"{query} (Context: {topic})"
 
-MODELS = [
-    "gemini-3.8-flash",
-    "gemini-3.7-flash",
-    "gemini-3.5-flash"
-]
 
-
-# ---------------------------------------------------------
-# Query Rewriting Function
-# ---------------------------------------------------------
-
-def rewrite_query(query, conversation_history=None):
-
-    if not conversation_history:
-        return query.strip()
-
-    history_text = "\n".join(conversation_history)
-
-    prompt = f"""
-You are a query rewriting component for an
-enterprise document intelligence system.
-
-Your job is to convert the user's latest question
-into a standalone search query.
-
-Rules:
-
-1. Preserve the exact meaning of the user's question.
-
-2. Use previous conversation ONLY to resolve references
-   such as:
-   - "it"
-   - "they"
-   - "that policy"
-   - "what about interns"
-   - "what about them"
-
-3. Do NOT answer the question.
-
-4. Do NOT add information that is not supported
-   by the conversation.
-
-5. Return ONLY the rewritten search query.
+def rewrite_query(query: str, conversation_history: Sequence[str] | None = None) -> str:
+    """Return a standalone query, falling back deterministically when Gemini is unavailable."""
+    query = query.strip()
+    history = _recent_history(conversation_history)
+    if not history:
+        return query
+    api_key = os.getenv("GEMINI_API_KEY")
+    if api_key:
+        prompt = f"""Rewrite the latest enterprise-document question as a standalone retrieval query.
+Use the conversation only to resolve references. Do not answer or add facts.
+Return only the rewritten query.
 
 Conversation:
-{history_text}
+{chr(10).join(history)}
 
-Latest user question:
-{query}
-
-Standalone search query:
-"""
-
-    # Try the models one by one
-    for model_name in MODELS:
-
-        try:
-            print(f"\nTrying model: {model_name}")
-
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt
-            )
-
-            if response.text:
-                print(f"Model used: {model_name}")
-                return response.text.strip()
-
-        except Exception as error:
-
-            print(f"Model unavailable: {model_name}")
-            print("Trying the next model...")
-
-    # If all models fail
-    raise RuntimeError(
-        "All Gemini models are currently unavailable. "
-        "Please try again later."
-    )
-
-
-# ---------------------------------------------------------
-# Test Program
-# ---------------------------------------------------------
-
-def main():
-
-    history = [
-        "User: How many annual leave days do employees get?",
-        "Assistant: Eligible full-time employees receive "
-        "18 days of annual leave per calendar year."
-    ]
-
-    query = input("Enter your follow-up question: ")
-
-    rewritten = rewrite_query(
-        query,
-        history
-    )
-
-    print("\n" + "=" * 60)
-    print("QUERY REWRITING")
-    print("=" * 60)
-
-    print("\nOriginal question:")
-    print(query)
-
-    print("\nRewritten search query:")
-    print(rewritten)
-
-    print("\n" + "=" * 60)
-
-
-# ---------------------------------------------------------
-# Program Entry Point
-# ---------------------------------------------------------
-
-if __name__ == "__main__":
-    main()
+Latest question: {query}"""
+        client = genai.Client(api_key=api_key)
+        for model_name in MODELS:
+            try:
+                text = getattr(client.models.generate_content(model=model_name, contents=prompt), "text", "").strip()
+                if text:
+                    print(f"[QueryRewriter] Rewritten with {model_name}.")
+                    return text
+            except Exception as error:
+                print(f"[QueryRewriter] {model_name} unavailable: {type(error).__name__}")
+    print("[QueryRewriter] Used bounded local fallback.")
+    return _local_rewrite(query, history)

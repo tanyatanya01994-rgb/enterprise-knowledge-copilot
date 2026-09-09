@@ -1,216 +1,524 @@
-"""Verify that reranked document chunks support a rewritten user query."""
+from __future__ import annotations
 
 import json
 import os
+import re
+from typing import Any
 
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
 
-# Load the same local Gemini configuration style used by the existing modules.
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 load_dotenv()
 
 API_KEY = os.getenv("GEMINI_API_KEY")
 
-if not API_KEY:
-    raise ValueError(
-        "GEMINI_API_KEY is not set in the .env file."
+VERIFICATION_TIMEOUT_MS = 120_000
+
+# Gemini models used for evidence verification.
+# If the first model is unavailable, the next model is tried.
+MODELS = [
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.8-flash",
+]
+
+VERIFIED = "verified"
+UNSUPPORTED = "unsupported"
+VERIFIER_UNAVAILABLE = "verifier_unavailable"
+
+
+# ============================================================
+# GEMINI CLIENT
+# ============================================================
+
+client = None
+
+if API_KEY:
+    try:
+        client = genai.Client(
+            api_key=API_KEY,
+            http_options=types.HttpOptions(
+                timeout=VERIFICATION_TIMEOUT_MS
+            ),
+        )
+
+    except Exception as error:
+        print(
+            "[EvidenceVerifier] Gemini client "
+            "initialization failed: "
+            f"{type(error).__name__}: {error}"
+        )
+
+else:
+    print(
+        "[EvidenceVerifier] GEMINI_API_KEY was not found. "
+        "Local verification fallback will be used."
     )
 
 
-client = genai.Client(api_key=API_KEY)
+# ============================================================
+# VERIFICATION PROMPT
+# ============================================================
 
+def build_verification_prompt(
+    query: str,
+    candidates: list[dict[str, Any]],
+) -> str:
+    """
+    Build a strict evidence-verification prompt.
 
-# Keep this verifier independent from the existing fallback lists.
-MODELS = [
-    "gemini-3.8-flash",
-    "gemini-3.7-flash",
-    "gemini-3.6-flash"
-]
+    Gemini is asked to return ONLY the chunk IDs that
+    directly or strongly support the user's question.
+    """
 
+    evidence_blocks = []
 
-def build_verification_prompt(query, reranked_results):
-    """Build one batched request containing only the candidate evidence."""
+    for index, result in enumerate(candidates, start=1):
 
-    evidence_text = ""
+        chunk = result.get("chunk", {})
 
-    for result in reranked_results:
+        evidence_blocks.append(
+            f"""
+EVIDENCE {index}
 
-        chunk = result["chunk"]
+Chunk ID:
+{chunk.get("chunk_id", "unknown")}
 
-        evidence_text += f"""
-CHUNK ID: {chunk.get('chunk_id')}
-Document: {chunk.get('document_name')}
-Page: {chunk.get('page_number')}
-Section: {chunk.get('section')}
-Text: {chunk.get('text')}
-----------------------------------------
+Document:
+{chunk.get("document_name", "unknown")}
+
+Page:
+{chunk.get("page_number", "unknown")}
+
+Section:
+{chunk.get("section", "unknown")}
+
+Text:
+{chunk.get("text", "")}
 """
+        )
+
+    evidence_text = "\n".join(evidence_blocks)
 
     return f"""
-You are an evidence verification component for an enterprise document
-intelligence system.
+You are the evidence verification component of an enterprise
+document intelligence RAG system.
 
-Decide whether the candidate evidence directly supports an answer to the
-standalone user question. Use only the evidence below. Do not infer missing
-facts, use outside knowledge, or rewrite evidence.
+Your task is to identify which retrieved evidence chunks
+actually support the user's question.
 
-Return JSON only. It must have exactly these fields:
-
-{{
-  "supported": true or false,
-  "supporting_chunk_ids": ["exact chunk IDs from the candidates"],
-  "abstain": true or false
-}}
-
-Rules:
-
-1. Mark supported true only when one or more candidate chunks directly support
-   an answer to the question.
-2. Include only chunk IDs that directly support the answer. Exclude chunks that
-   are irrelevant, only loosely related, or do not contain the needed facts.
-3. If the evidence is insufficient, return supported false, an empty list, and
-   abstain true.
-4. If supported is true, abstain must be false and the list must be non-empty.
-5. If supported is false, abstain must be true and the list must be empty.
-6. Never create a chunk ID that is not present in the candidates.
-
-STANDALONE USER QUESTION:
+USER QUESTION:
 {query}
 
-CANDIDATE EVIDENCE:
+RETRIEVED EVIDENCE:
 {evidence_text}
+
+STRICT RULES:
+
+1. Approve a chunk only when its text directly or strongly
+   supports information needed to answer the question.
+
+2. Do not approve a chunk merely because it comes from a
+   related document.
+
+3. Do not use outside knowledge.
+
+4. Do not infer facts that are not supported by the evidence.
+
+5. If the retrieved evidence is insufficient, return an
+   empty approved_chunk_ids list.
+
+6. You may approve multiple chunks when multiple pieces of
+   evidence are required.
+
+7. Return ONLY valid JSON.
+
+8. Use exactly this JSON structure:
+
+{{
+  "approved_chunk_ids": [
+    "chunk_id_1",
+    "chunk_id_2"
+  ]
+}}
+
+Do not include markdown.
+Do not include explanations.
+Do not include any additional fields.
 """
 
 
-def parse_verification_response(response_text, valid_chunk_ids):
-    """Validate the strict JSON contract and return approved chunk IDs.
+# ============================================================
+# RESPONSE PARSER
+# ============================================================
 
-    Returning ``None`` means the response is unsafe and must cause abstention.
+def parse_verification_response(
+    response_text: str,
+) -> list[str]:
     """
+    Safely parse Gemini's verification response.
+
+    Returns an empty list if the response is invalid.
+    """
+
+    if not response_text:
+        return []
+
+    text = response_text.strip()
+
+    # Remove accidental markdown code fences.
+    text = re.sub(
+        r"^```(?:json)?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    text = re.sub(
+        r"\s*```$",
+        "",
+        text,
+    )
 
     try:
-        response_data = json.loads(response_text)
-    except (TypeError, json.JSONDecodeError):
-        return None
+        data = json.loads(text)
 
-    expected_keys = {
-        "supported",
-        "supporting_chunk_ids",
-        "abstain"
-    }
+    except json.JSONDecodeError:
+        print(
+            "[EvidenceVerifier] Invalid JSON returned "
+            "by Gemini."
+        )
+        return []
 
-    if set(response_data.keys()) != expected_keys:
-        return None
+    if not isinstance(data, dict):
+        return []
 
-    supported = response_data["supported"]
-    supporting_chunk_ids = response_data["supporting_chunk_ids"]
-    abstain = response_data["abstain"]
+    # Accept the earlier test/CLI schema as well as the current prompt
+    # schema.  Both are validated against the supplied candidate IDs later.
+    approved = data.get("approved_chunk_ids")
+    if approved is None and data.get("supported") is True and not data.get("abstain"):
+        approved = data.get("supporting_chunk_ids", [])
+    if approved is None:
+        approved = []
 
-    if not isinstance(supported, bool):
-        return None
+    if not isinstance(approved, list):
+        return []
 
-    if not isinstance(abstain, bool):
-        return None
-
-    if not isinstance(supporting_chunk_ids, list):
-        return None
-
-    if not all(
-        isinstance(chunk_id, str)
-        for chunk_id in supporting_chunk_ids
-    ):
-        return None
-
-    # Both possible outcomes have one unambiguous, safe representation.
-    if supported is False:
-        if abstain is True and not supporting_chunk_ids:
-            return []
-
-        return None
-
-    if abstain is True or not supporting_chunk_ids:
-        return None
-
-    # Reject the entire result rather than silently accepting invented IDs.
-    if not set(supporting_chunk_ids).issubset(valid_chunk_ids):
-        return None
-
-    return set(supporting_chunk_ids)
+    return [
+        str(chunk_id)
+        for chunk_id in approved
+        if chunk_id
+    ]
 
 
-def verify_evidence(query, reranked_results):
-    """Return verified original results and an abstention flag.
+# ============================================================
+# TOKENIZATION FOR LOCAL FALLBACK
+# ============================================================
 
-    The function fails closed: invalid output, an unexpected response, or all
-    unavailable models returns no evidence and ``True`` for abstention.
+STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "can",
+    "could",
+    "do",
+    "does",
+    "for",
+    "from",
+    "get",
+    "gets",
+    "how",
+    "if",
+    "in",
+    "is",
+    "it",
+    "its",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "their",
+    "this",
+    "to",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
+}
+
+
+def tokenize(text: str) -> set[str]:
+    """
+    Convert text into meaningful lowercase tokens.
     """
 
-    if not reranked_results:
-        return [], True
+    words = re.findall(
+        r"[a-zA-Z0-9]+",
+        text.lower(),
+    )
 
-    valid_chunk_ids = {
-        result["chunk"].get("chunk_id")
-        for result in reranked_results
+    return {
+        word
+        for word in words
+        if len(word) >= 3
+        and word not in STOPWORDS
     }
 
-    if None in valid_chunk_ids:
-        return [], True
+
+# ============================================================
+# LOCAL FALLBACK VERIFICATION
+# ============================================================
+
+def local_evidence_verification(
+    query: str,
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Conservative deterministic fallback.
+
+    This is used only when Gemini verification cannot be
+    completed.
+
+    It requires meaningful lexical overlap between the
+    question and retrieved evidence.
+
+    This does NOT replace the normal Gemini verifier when
+    Gemini is available.
+    """
+
+    query_tokens = tokenize(query)
+
+    if not query_tokens:
+        return []
+
+    approved = []
+
+    for result in candidates:
+
+        chunk = result.get(
+            "chunk",
+            {},
+        )
+
+        text = str(
+            chunk.get(
+                "text",
+                "",
+            )
+        )
+
+        chunk_tokens = tokenize(text)
+
+        if not chunk_tokens:
+            continue
+
+        overlap = query_tokens.intersection(
+            chunk_tokens
+        )
+
+        # Number of meaningful query terms that occur
+        # in the evidence.
+        overlap_count = len(overlap)
+
+        if overlap_count < 2:
+            continue
+
+        # Query-term coverage.
+        coverage = (
+            overlap_count
+            / max(len(query_tokens), 1)
+        )
+
+        # Require reasonable overlap.
+        if coverage >= 0.20:
+            approved.append(result)
+
+    # Preserve reranker order and limit the evidence.
+    return approved[:5]
+
+
+# ============================================================
+# GEMINI VERIFICATION
+# ============================================================
+
+def _gemini_verify(
+    query: str,
+    candidates: list[dict[str, Any]],
+) -> list[str]:
+    """
+    Ask Gemini to verify which chunks support the query.
+
+    Raises an exception if all configured Gemini models fail.
+    """
+
+    if client is None:
+        raise RuntimeError(
+            "Gemini verifier client is unavailable."
+        )
 
     prompt = build_verification_prompt(
         query,
-        reranked_results
+        candidates,
     )
+
+    last_error = None
 
     for model_name in MODELS:
 
-        print(f"\nTrying verifier model: {model_name}")
-
         try:
+
+            print(
+                "[EvidenceVerifier] Trying model: "
+                f"{model_name}"
+            )
+
             response = client.models.generate_content(
                 model=model_name,
                 contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json"
+            )
+
+            response_text = getattr(
+                response,
+                "text",
+                "",
+            )
+
+            if not response_text:
+                raise RuntimeError(
+                    f"{model_name} returned an empty response."
+                )
+
+            approved_ids = parse_verification_response(
+                response_text
+            )
+
+            print(
+                "[EvidenceVerifier] Model "
+                f"{model_name} approved "
+                f"{len(approved_ids)} chunks."
+            )
+
+            return approved_ids
+
+        except Exception as error:
+
+            last_error = error
+
+            print(
+                "[EvidenceVerifier] Model "
+                f"{model_name} failed: "
+                f"{type(error).__name__}: {error}"
+            )
+
+            continue
+
+    raise RuntimeError(
+        "All Gemini evidence-verification models failed. "
+        f"Last error: {last_error}"
+    )
+
+
+# ============================================================
+# PUBLIC VERIFICATION FUNCTION
+# ============================================================
+
+def verify_evidence(
+    query: str,
+    candidates: list[dict[str, Any]],
+):
+    """
+    Verify retrieved evidence.
+
+    Returns ``(verified_results, status)`` where status is one of
+    ``verified``, ``unsupported``, or ``verifier_unavailable``.  The
+    unavailable state is deliberately distinct from a verified absence of
+    evidence so callers do not make a misleading knowledge-base claim.
+
+    Primary verification:
+        Gemini
+
+    Fallback verification:
+        Conservative local lexical verification
+    """
+
+    # --------------------------------------------------------
+    # NO CANDIDATES
+    # --------------------------------------------------------
+
+    if not candidates:
+        return [], UNSUPPORTED
+
+    # --------------------------------------------------------
+    # PRIMARY: GEMINI VERIFICATION
+    # --------------------------------------------------------
+
+    try:
+
+        approved_ids = _gemini_verify(
+            query,
+            candidates,
+        )
+
+        approved_set = set(
+            approved_ids
+        )
+
+        verified = []
+
+        for result in candidates:
+
+            chunk = result.get(
+                "chunk",
+                {},
+            )
+
+            chunk_id = str(
+                chunk.get(
+                    "chunk_id",
+                    "",
                 )
             )
 
-        except Exception as error:
-            print(
-                "Verifier model unavailable: "
-                f"{model_name} ({type(error).__name__})"
-            )
-            continue
+            if chunk_id in approved_set:
+                verified.append(result)
 
-        approved_chunk_ids = parse_verification_response(
-            getattr(response, "text", None),
-            valid_chunk_ids
+        print(
+            "[EvidenceVerifier] Gemini verification "
+            f"approved {len(verified)} / "
+            f"{len(candidates)} candidates."
         )
 
-        # A malformed or unsafe response must abstain immediately.
-        if approved_chunk_ids is None:
-            print("Verifier response was unsafe. Abstaining.")
-            return [], True
+        return (verified, VERIFIED) if verified else ([], UNSUPPORTED)
 
-        # The model explicitly found no support.
-        if not approved_chunk_ids:
-            print(f"Evidence verified using: {model_name}")
-            return [], True
+    except Exception as error:
 
-        # Filter the existing result dictionaries. Never rebuild them from AI.
-        verified_results = [
-            result
-            for result in reranked_results
-            if result["chunk"].get("chunk_id")
-            in approved_chunk_ids
-        ]
+        print(
+            "[EvidenceVerifier] Gemini verification "
+            "could not be completed."
+        )
 
-        if not verified_results:
-            return [], True
+        print(
+            "[EvidenceVerifier] Reason: "
+            f"{type(error).__name__}: {error}"
+        )
 
-        print(f"Evidence verified using: {model_name}")
-        return verified_results, False
-
-    print("All verifier models were unavailable. Abstaining.")
-    return [], True
+        # Fail closed.  Lexical overlap is useful for diagnostics but is not
+        # proof that evidence supports an answer, and an API outage must not
+        # be reported as a successful verified evaluation.
+        print("[EvidenceVerifier] Failing closed; no answer will be generated.")
+        return [], VERIFIER_UNAVAILABLE

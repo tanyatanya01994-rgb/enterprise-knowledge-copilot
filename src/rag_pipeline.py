@@ -1,21 +1,22 @@
 from pathlib import Path
+import re
 
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 
 from query_rewriter import rewrite_query
-from answer_generator import generate_answer
-
 from hybrid_search import (
     load_chunks,
     build_bm25,
     semantic_search,
     bm25_search,
-    reciprocal_rank_fusion
+    reciprocal_rank_fusion,
+    get_available_documents,
 )
 
 from reranker import rerank_results
-from evidence_verifier import verify_evidence
+from evidence_verifier import VERIFIED, verify_evidence
+from confidence import calculate_confidence
 
 
 # ============================================================
@@ -29,6 +30,32 @@ VECTORSTORE_DIR = PROJECT_ROOT / "vectorstore"
 COLLECTION_NAME = "enterprise_documents"
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+
+# Minimum confidence required before generating an answer.
+CONFIDENCE_THRESHOLD = 45.0
+
+
+def is_multi_document_query(query: str) -> bool:
+    """Detect questions that explicitly require comparing or joining sources."""
+    normalized = " ".join(query.lower().split())
+    patterns = (
+        r"\bcompare\b.*\b(with|and|to|versus|vs\.? )\b",
+        r"\bdifference between\b",
+        r"\bhow do\b.*\bdiffer\b",
+        r"\bversus\b|\bvs\.?\b",
+        r"\brelationship between\b",
+        r"\bacross\s+(?:the\s+)?(?:policies|documents)\b",
+    )
+    return any(re.search(pattern, normalized) for pattern in patterns)
+
+
+def covered_documents(results):
+    """Return deterministic source-document coverage for verified evidence."""
+    return sorted({
+        str(result.get("chunk", {}).get("document_name"))
+        for result in results
+        if result.get("chunk", {}).get("document_name")
+    })
 
 
 # ============================================================
@@ -73,12 +100,84 @@ def initialize_retrieval():
         chunks,
         embedding_model,
         client,
-        bm25
+        bm25,
     )
 
 
 # ============================================================
-# RETRIEVE EVIDENCE
+# DOCUMENT FILTER
+# ============================================================
+
+def select_document_filter(chunks):
+
+    documents = get_available_documents(
+        chunks
+    )
+
+    print("\n" + "=" * 75)
+    print("DOCUMENT FILTER")
+    print("=" * 75)
+
+    print("\n0. All Documents")
+
+    for index, document in enumerate(
+        documents,
+        start=1
+    ):
+        print(
+            f"{index}. {document}"
+        )
+
+    while True:
+
+        choice = input(
+            "\nSelect document "
+            "(0 for all documents): "
+        ).strip()
+
+        if choice == "0":
+
+            print(
+                "\nActive document filter: "
+                "All Documents"
+            )
+
+            return None
+
+        try:
+
+            index = int(choice)
+
+        except ValueError:
+
+            print(
+                "\nInvalid selection. "
+                "Please enter a number."
+            )
+
+            continue
+
+        if 1 <= index <= len(documents):
+
+            selected_document = documents[
+                index - 1
+            ]
+
+            print(
+                "\nActive document filter: "
+                f"{selected_document}"
+            )
+
+            return selected_document
+
+        print(
+            "\nInvalid document number. "
+            "Please try again."
+        )
+
+
+# ============================================================
+# RETRIEVE AND VERIFY EVIDENCE
 # ============================================================
 
 def retrieve_evidence(
@@ -87,18 +186,26 @@ def retrieve_evidence(
     chunks,
     embedding_model,
     client,
-    bm25
+    bm25,
+    document_name=None,
 ):
+
+    multi_document_query = is_multi_document_query(query)
+    # An explicit sidebar filter is authoritative. With All Documents, a
+    # comparison gets a larger candidate pool so relevant policies can survive
+    # fusion and reranking together.
+    candidate_limit = 15 if multi_document_query and not document_name else 10
+    rerank_limit = 8 if multi_document_query and not document_name else 5
 
     # --------------------------------------------------------
     # STEP 1: QUERY REWRITING
     # --------------------------------------------------------
 
-    print("\n[1/4] Rewriting query...")
+    print("\n[1/7] Rewriting query...")
 
     rewritten_query = rewrite_query(
         query,
-        conversation_history
+        conversation_history,
     )
 
     print("\nOriginal query:")
@@ -107,18 +214,18 @@ def retrieve_evidence(
     print("\nRewritten search query:")
     print(rewritten_query)
 
-
     # --------------------------------------------------------
     # STEP 2: SEMANTIC SEARCH
     # --------------------------------------------------------
 
-    print("\n[2/4] Running semantic search...")
+    print("\n[2/7] Running semantic search...")
 
     semantic_results = semantic_search(
         rewritten_query,
         embedding_model,
         client,
-        top_k=10
+        top_k=candidate_limit,
+        document_name=document_name,
     )
 
     print(
@@ -126,18 +233,18 @@ def retrieve_evidence(
         f"{len(semantic_results)} results."
     )
 
-
     # --------------------------------------------------------
     # STEP 3: BM25 SEARCH
     # --------------------------------------------------------
 
-    print("\n[3/4] Running BM25 search...")
+    print("\n[3/7] Running BM25 search...")
 
     bm25_results = bm25_search(
         rewritten_query,
         chunks,
         bm25,
-        top_k=10
+        top_k=candidate_limit,
+        document_name=document_name,
     )
 
     print(
@@ -145,37 +252,37 @@ def retrieve_evidence(
         f"{len(bm25_results)} results."
     )
 
-
     # --------------------------------------------------------
     # STEP 4: HYBRID SEARCH + RRF
     # --------------------------------------------------------
 
-    print("\nCombining semantic + BM25 results...")
+    print(
+        "\n[4/7] Combining semantic + BM25 results..."
+    )
 
     hybrid_results = reciprocal_rank_fusion(
         semantic_results,
         bm25_results,
-        chunks
+        chunks,
     )
 
-    hybrid_results = hybrid_results[:10]
+    hybrid_results = hybrid_results[:candidate_limit]
 
     print(
         f"Hybrid retrieval candidates: "
         f"{len(hybrid_results)}"
     )
 
-
     # --------------------------------------------------------
     # STEP 5: RERANKING
     # --------------------------------------------------------
 
-    print("\n[4/4] Reranking results...")
+    print("\n[5/7] Reranking results...")
 
     reranked_results = rerank_results(
         rewritten_query,
         hybrid_results,
-        top_k=5
+        top_k=rerank_limit,
     )
 
     print(
@@ -187,11 +294,13 @@ def retrieve_evidence(
     # STEP 6: EVIDENCE VERIFICATION
     # --------------------------------------------------------
 
-    print("\n[5/5] Verifying evidence support...")
+    print(
+        "\n[6/7] Verifying evidence support..."
+    )
 
-    verified_results, abstained = verify_evidence(
+    verified_results, verification_status = verify_evidence(
         rewritten_query,
-        reranked_results
+        reranked_results,
     )
 
     print(
@@ -199,15 +308,58 @@ def retrieve_evidence(
         f"{len(verified_results)}"
     )
 
+    # --------------------------------------------------------
+    # STEP 7: RETRIEVAL CONFIDENCE SCORING
+    # --------------------------------------------------------
+
+    confidence = calculate_confidence(
+        reranked_results,
+        verified_results,
+        verification_status,
+        multi_document_query=multi_document_query,
+    )
+
+    print(
+        f"Retrieval Confidence: "
+        f"{confidence['score'] if confidence['score'] is not None else 'Unavailable'} - "
+        f"{confidence['level']}"
+    )
+
+    # --------------------------------------------------------
+    # APPLY CONFIDENCE THRESHOLD
+    # --------------------------------------------------------
+
+    confidence_abstained = (
+        verification_status == VERIFIED
+        and confidence["score"] < CONFIDENCE_THRESHOLD
+    )
+
+    coverage_abstained = (
+        multi_document_query
+        and verification_status == VERIFIED
+        and not confidence["coverage_sufficient"]
+    )
+
+    final_abstained = (
+        verification_status != VERIFIED or confidence_abstained or coverage_abstained
+    )
+
+    print(
+        f"Confidence Threshold: "
+        f"{CONFIDENCE_THRESHOLD:.1f}%"
+    )
+
     print(
         f"Abstained: "
-        f"{'Yes' if abstained else 'No'}"
+        f"{'Yes' if final_abstained else 'No'}"
     )
 
     return (
         rewritten_query,
         verified_results,
-        abstained
+        final_abstained,
+        confidence,
+        verification_status,
     )
 
 
@@ -218,7 +370,9 @@ def retrieve_evidence(
 def display_results(
     original_query,
     rewritten_query,
-    results
+    results,
+    confidence,
+    document_name=None,
 ):
 
     print("\n")
@@ -232,14 +386,32 @@ def display_results(
     print("\nRewritten Search Query:")
     print(rewritten_query)
 
-    print("\n" + "-" * 75)
-    print("TOP EVIDENCE")
-    print("-" * 75)
+    print("\nDocument Filter:")
+    print(
+        document_name
+        if document_name
+        else "All Documents"
+    )
 
+    print("\nRetrieval Confidence:")
+    print(
+        f"{confidence['score']:.1f}% - "
+        f"{confidence['level']}"
+    )
+
+    print(
+        f"Verified Evidence: "
+        f"{confidence['verified_count']} / "
+        f"{confidence['reranked_count']}"
+    )
+
+    print("\n" + "-" * 75)
+    print("VERIFIED TOP EVIDENCE")
+    print("-" * 75)
 
     for rank, result in enumerate(
         results,
-        start=1
+        start=1,
     ):
 
         chunk = result["chunk"]
@@ -286,7 +458,6 @@ def display_results(
             chunk.get("text")
         )
 
-
     print("\n" + "=" * 75)
 
 
@@ -304,13 +475,21 @@ def main():
         chunks,
         embedding_model,
         client,
-        bm25
+        bm25,
     ) = initialize_retrieval()
 
+    # --------------------------------------------------------
+    # DOCUMENT FILTER
+    # --------------------------------------------------------
+
+    document_name = select_document_filter(
+        chunks
+    )
 
     # --------------------------------------------------------
     # SAMPLE CONVERSATION HISTORY
     # --------------------------------------------------------
+    #
     # This demonstrates conversational query rewriting.
     #
     # Previous:
@@ -327,10 +506,9 @@ def main():
         "User: How many annual leave days do employees get?",
 
         "Assistant: Eligible full-time employees receive "
-        "18 days of annual leave per calendar year."
+        "18 days of annual leave per calendar year.",
 
     ]
-
 
     # --------------------------------------------------------
     # GET USER QUESTION
@@ -339,7 +517,6 @@ def main():
     query = input(
         "\nEnter your question: "
     ).strip()
-
 
     # --------------------------------------------------------
     # VALIDATE QUESTION
@@ -353,7 +530,6 @@ def main():
 
         return
 
-
     # --------------------------------------------------------
     # RUN RETRIEVAL PIPELINE
     # --------------------------------------------------------
@@ -361,7 +537,9 @@ def main():
     (
         rewritten_query,
         results,
-        abstained
+        abstained,
+        confidence,
+        verification_status,
     ) = retrieve_evidence(
 
         query,
@@ -374,13 +552,21 @@ def main():
 
         client,
 
-        bm25
+        bm25,
+
+        document_name,
     )
 
+    # --------------------------------------------------------
+    # ABSTAIN WHEN EVIDENCE IS MISSING
+    # OR CONFIDENCE IS LOW
+    # --------------------------------------------------------
 
-    # --------------------------------------------------------
-    # ABSTAIN WHEN NO VERIFIED EVIDENCE SUPPORTS THE QUESTION
-    # --------------------------------------------------------
+    if verification_status == "verifier_unavailable":
+
+        print("\nEvidence verification is temporarily unavailable.")
+        print("No unverified answer was generated.")
+        return
 
     if abstained:
 
@@ -391,20 +577,41 @@ def main():
         print("\nQuestion:")
         print(query)
 
+        print("\nDocument Filter:")
+        print(
+            document_name
+            if document_name
+            else "All Documents"
+        )
+
         print("\nAnswer:")
+
         print(
             "The information is not available in the "
-            "provided documents."
+            "provided documents with sufficient confidence."
+        )
+
+        print(
+            f"\nRetrieval Confidence: "
+            f"{confidence['score']:.1f}% - "
+            f"{confidence['level']}"
+        )
+
+        print(
+            f"Required Confidence: "
+            f"{CONFIDENCE_THRESHOLD:.1f}%"
         )
 
         print("\n\nSOURCES")
         print("-" * 50)
-        print("No verified supporting sources available.")
+
+        print(
+            "No verified supporting sources available."
+        )
 
         print("\n" + "=" * 75)
 
         return
-
 
     # --------------------------------------------------------
     # DISPLAY VERIFIED EVIDENCE
@@ -416,27 +623,27 @@ def main():
 
         rewritten_query,
 
-        results
+        results,
 
+        confidence,
+
+        document_name,
     )
-
 
     # --------------------------------------------------------
     # GENERATE GROUNDED ANSWER
     # --------------------------------------------------------
 
     print(
-        "\n[6/6] Generating grounded answer..."
+        "\n[7/7] Generating grounded answer..."
     )
 
     answer = generate_answer(
 
         rewritten_query,
 
-        results
-
+        results,
     )
-
 
     # --------------------------------------------------------
     # DISPLAY FINAL ANSWER
@@ -452,16 +659,70 @@ def main():
 
     print("=" * 75)
 
-
     print("\nQuestion:")
 
     print(query)
 
+    print("\nDocument Filter:")
+
+    print(
+        document_name
+        if document_name
+        else "All Documents"
+    )
 
     print("\nAnswer:")
 
     print(answer)
 
+    print(
+        f"\nRetrieval Confidence: "
+        f"{confidence['score']:.1f}% - "
+        f"{confidence['level']}"
+    )
+
+    print(
+        f"Verified Evidence Chunks: "
+        f"{confidence['verified_count']}"
+    )
+
+    # --------------------------------------------------------
+    # SOURCE ATTRIBUTION
+    # --------------------------------------------------------
+
+    print("\nSOURCES")
+
+    print("-" * 75)
+
+    seen_sources = set()
+
+    for result in results:
+
+        chunk = result["chunk"]
+
+        source = (
+            chunk.get("document_name"),
+            chunk.get("page_number"),
+            chunk.get("section"),
+        )
+
+        if source in seen_sources:
+            continue
+
+        seen_sources.add(source)
+
+        print(
+            f"{len(seen_sources)}. "
+            f"{source[0]} | "
+            f"Page {source[1]} | "
+            f"Section: {source[2]}"
+        )
+
+    if not seen_sources:
+
+        print(
+            "No verified supporting sources available."
+        )
 
     print("\n" + "=" * 75)
 

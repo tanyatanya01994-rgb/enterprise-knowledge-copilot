@@ -81,12 +81,12 @@ class EvidenceVerifierTests(unittest.TestCase):
             '["Leave_Policy_0001"], "abstain": false}'
         ])
 
-        verified, abstained = evidence_verifier.verify_evidence(
+        verified, status = evidence_verifier.verify_evidence(
             "How many annual leave days do employees get?",
             self.results
         )
 
-        self.assertFalse(abstained)
+        self.assertEqual(status, "verified")
         self.assertEqual(len(verified), 1)
         self.assertIs(verified[0], self.results[0])
 
@@ -96,13 +96,13 @@ class EvidenceVerifierTests(unittest.TestCase):
             '"abstain": true}'
         ])
 
-        verified, abstained = evidence_verifier.verify_evidence(
+        verified, status = evidence_verifier.verify_evidence(
             "What is the company's current stock price?",
             self.results
         )
 
         self.assertEqual(verified, [])
-        self.assertTrue(abstained)
+        self.assertEqual(status, "unsupported")
 
     def test_invalid_chunk_id_abstains(self):
         self.set_responses([
@@ -110,39 +110,39 @@ class EvidenceVerifierTests(unittest.TestCase):
             '["Leave_Policy_9999"], "abstain": false}'
         ])
 
-        verified, abstained = evidence_verifier.verify_evidence(
+        verified, status = evidence_verifier.verify_evidence(
             "How many annual leave days do employees get?",
             self.results
         )
 
         self.assertEqual(verified, [])
-        self.assertTrue(abstained)
+        self.assertEqual(status, "unsupported")
 
     def test_malformed_json_abstains(self):
         self.set_responses(["this is not JSON"])
 
-        verified, abstained = evidence_verifier.verify_evidence(
+        verified, status = evidence_verifier.verify_evidence(
             "How many annual leave days do employees get?",
             self.results
         )
 
         self.assertEqual(verified, [])
-        self.assertTrue(abstained)
+        self.assertEqual(status, "unsupported")
 
-    def test_all_models_failing_abstains(self):
+    def test_api_failure_is_verifier_unavailable_and_fails_closed(self):
         self.set_responses([
             RuntimeError("first model unavailable"),
             RuntimeError("second model unavailable"),
             RuntimeError("third model unavailable")
         ])
 
-        verified, abstained = evidence_verifier.verify_evidence(
+        verified, status = evidence_verifier.verify_evidence(
             "How many annual leave days do employees get?",
             self.results
         )
 
         self.assertEqual(verified, [])
-        self.assertTrue(abstained)
+        self.assertEqual(status, "verifier_unavailable")
 
     def test_follow_up_query_without_direct_support_abstains(self):
         self.set_responses([
@@ -150,13 +150,13 @@ class EvidenceVerifierTests(unittest.TestCase):
             '"abstain": true}'
         ])
 
-        verified, abstained = evidence_verifier.verify_evidence(
+        verified, status = evidence_verifier.verify_evidence(
             "How many annual leave days do interns get?",
             self.results
         )
 
         self.assertEqual(verified, [])
-        self.assertTrue(abstained)
+        self.assertEqual(status, "unsupported")
 
 
 if __name__ == "__main__":

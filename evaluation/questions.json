@@ -1,0 +1,106 @@
+[
+  {
+    "id": "Q01",
+    "type": "supported",
+    "question": "How many annual leave days do eligible full-time employees receive?"
+  },
+  {
+    "id": "Q02",
+    "type": "supported",
+    "question": "What is the work from home policy?"
+  },
+  {
+    "id": "Q03",
+    "type": "supported",
+    "question": "What employee benefits are provided?"
+  },
+  {
+    "id": "Q04",
+    "type": "supported",
+    "question": "What is the resignation notice period?"
+  },
+  {
+    "id": "Q05",
+    "type": "supported",
+    "question": "What are the key rules in the code of conduct?"
+  },
+  {
+    "id": "Q06",
+    "type": "supported",
+    "question": "What is the attendance policy?"
+  },
+  {
+    "id": "Q07",
+    "type": "supported",
+    "question": "What compensation-related policies apply to employees?"
+  },
+  {
+    "id": "Q08",
+    "type": "supported",
+    "question": "What happens during the employee exit process?"
+  },
+  {
+    "id": "Q09",
+    "type": "supported",
+    "question": "Who is eligible for work from home?"
+  },
+  {
+    "id": "Q10",
+    "type": "supported",
+    "question": "What are the main employee benefit categories?"
+  },
+  {
+    "id": "Q11",
+    "type": "follow_up",
+    "question": "What about interns?",
+    "history": [
+      "User: How many annual leave days do eligible full-time employees receive?",
+      "Assistant: Eligible full-time employees receive 18 days of annual leave per calendar year."
+    ]
+  },
+  {
+    "id": "Q12",
+    "type": "multi_document",
+    "question": "Compare the annual leave policy with the work from home policy."
+  },
+  {
+    "id": "Q13",
+    "type": "multi_document",
+    "question": "How do employee benefits and leave provisions apply to eligible full-time employees?"
+  },
+  {
+    "id": "Q14",
+    "type": "unsupported",
+    "question": "What is the company's office location in London?"
+  },
+  {
+    "id": "Q15",
+    "type": "unsupported",
+    "question": "What is the CEO's personal phone number?"
+  },
+  {
+    "id": "Q16",
+    "type": "unsupported",
+    "question": "What will the employee bonus percentage be in 2027?"
+  },
+  {
+    "id": "Q17",
+    "type": "unsupported",
+    "question": "What is the company's stock price today?"
+  },
+  {
+    "id": "Q18",
+    "type": "unsupported",
+    "question": "What is the salary of the company's CEO?"
+  },
+  {
+    "id": "Q19",
+    "type": "supported",
+    "question": "What are the requirements for requesting work from home?"
+  },
+  {
+    "id": "Q20",
+    "type": "supported",
+    "question": "What are the main responsibilities and expectations described in the employee handbook?"
+  }
+]

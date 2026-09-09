@@ -35,3 +35,8 @@ Thumbs.db
 secrets/
 # Pipeline test artifacts
 .pipeline-*.txt
+
+# Local evaluation output (generated from a run, never benchmark fixtures)
+evaluation/results.json
+
+!.env.example
