@@ -3,6 +3,7 @@ import re
 
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct
 
 from query_rewriter import rewrite_query
 from hybrid_search import (
@@ -17,6 +18,7 @@ from hybrid_search import (
 from reranker import rerank_results
 from evidence_verifier import VERIFIED, verify_evidence
 from confidence import calculate_confidence
+from answer_generator import generate_answer
 
 
 # ============================================================
@@ -37,7 +39,9 @@ CONFIDENCE_THRESHOLD = 45.0
 
 def is_multi_document_query(query: str) -> bool:
     """Detect questions that explicitly require comparing or joining sources."""
+
     normalized = " ".join(query.lower().split())
+
     patterns = (
         r"\bcompare\b.*\b(with|and|to|versus|vs\.? )\b",
         r"\bdifference between\b",
@@ -46,16 +50,23 @@ def is_multi_document_query(query: str) -> bool:
         r"\brelationship between\b",
         r"\bacross\s+(?:the\s+)?(?:policies|documents)\b",
     )
-    return any(re.search(pattern, normalized) for pattern in patterns)
+
+    return any(
+        re.search(pattern, normalized)
+        for pattern in patterns
+    )
 
 
 def covered_documents(results):
     """Return deterministic source-document coverage for verified evidence."""
-    return sorted({
-        str(result.get("chunk", {}).get("document_name"))
-        for result in results
-        if result.get("chunk", {}).get("document_name")
-    })
+
+    return sorted(
+        {
+            str(result.get("chunk", {}).get("document_name"))
+            for result in results
+            if result.get("chunk", {}).get("document_name")
+        }
+    )
 
 
 # ============================================================
@@ -68,11 +79,21 @@ def initialize_retrieval():
     print("        ENTERPRISE KNOWLEDGE INTELLIGENCE COPILOT")
     print("=" * 75)
 
+    # --------------------------------------------------------
+    # LOAD DOCUMENT CHUNKS
+    # --------------------------------------------------------
+
     print("\nLoading document chunks...")
 
     chunks = load_chunks()
 
-    print(f"Loaded {len(chunks)} chunks.")
+    print(
+        f"Loaded {len(chunks)} chunks."
+    )
+
+    # --------------------------------------------------------
+    # LOAD EMBEDDING MODEL
+    # --------------------------------------------------------
 
     print("\nLoading embedding model...")
 
@@ -82,19 +103,111 @@ def initialize_retrieval():
 
     print("Embedding model loaded.")
 
+    # --------------------------------------------------------
+    # CONNECT TO QDRANT
+    # --------------------------------------------------------
+
     print("\nConnecting to Qdrant...")
 
     client = QdrantClient(
         path=str(VECTORSTORE_DIR)
     )
 
-    print("Qdrant connected.")
+    # --------------------------------------------------------
+    # CLOUD-SAFE COLLECTION INITIALIZATION
+    # --------------------------------------------------------
+
+    if not client.collection_exists(
+        COLLECTION_NAME
+    ):
+
+        print(
+            "Qdrant collection not found."
+        )
+
+        print(
+            "Building enterprise_documents "
+            "collection from chunks..."
+        )
+
+        # Create embeddings for all chunks.
+        chunk_texts = [
+            chunk["text"]
+            for chunk in chunks
+        ]
+
+        embeddings = embedding_model.encode(
+            chunk_texts,
+            show_progress_bar=False
+        )
+
+        # Create the Qdrant collection.
+        client.create_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=VectorParams(
+                size=embeddings.shape[1],
+                distance=Distance.COSINE
+            )
+        )
+
+        # ----------------------------------------------------
+        # PREPARE VECTOR POINTS
+        # ----------------------------------------------------
+
+        points = []
+
+        for index, (
+            chunk,
+            embedding
+        ) in enumerate(
+            zip(chunks, embeddings)
+        ):
+
+            points.append(
+                PointStruct(
+                    id=index,
+                    vector=embedding.tolist(),
+                    payload=chunk
+                )
+            )
+
+        # ----------------------------------------------------
+        # INSERT VECTORS
+        # ----------------------------------------------------
+
+        client.upsert(
+            collection_name=COLLECTION_NAME,
+            points=points
+        )
+
+        print(
+            f"Qdrant collection created with "
+            f"{len(points)} vectors."
+        )
+
+    else:
+
+        print(
+            "Qdrant collection found."
+        )
+
+    print(
+        "Qdrant connected."
+    )
+
+    # --------------------------------------------------------
+    # BUILD BM25 INDEX
+    # --------------------------------------------------------
 
     print("\nBuilding BM25 index...")
 
-    bm25 = build_bm25(chunks)
+    bm25 = build_bm25(
+        chunks
+    )
 
-    print("BM25 index ready.")
+    print(
+        "BM25 index ready."
+    )
 
     return (
         chunks,
@@ -114,16 +227,27 @@ def select_document_filter(chunks):
         chunks
     )
 
-    print("\n" + "=" * 75)
-    print("DOCUMENT FILTER")
-    print("=" * 75)
+    print(
+        "\n" + "=" * 75
+    )
 
-    print("\n0. All Documents")
+    print(
+        "DOCUMENT FILTER"
+    )
+
+    print(
+        "=" * 75
+    )
+
+    print(
+        "\n0. All Documents"
+    )
 
     for index, document in enumerate(
         documents,
         start=1
     ):
+
         print(
             f"{index}. {document}"
         )
@@ -146,7 +270,9 @@ def select_document_filter(chunks):
 
         try:
 
-            index = int(choice)
+            index = int(
+                choice
+            )
 
         except ValueError:
 
@@ -190,35 +316,67 @@ def retrieve_evidence(
     document_name=None,
 ):
 
-    multi_document_query = is_multi_document_query(query)
-    # An explicit sidebar filter is authoritative. With All Documents, a
-    # comparison gets a larger candidate pool so relevant policies can survive
+    multi_document_query = (
+        is_multi_document_query(
+            query
+        )
+    )
+
+    # An explicit sidebar filter is authoritative.
+    # With All Documents, a comparison gets a larger
+    # candidate pool so relevant policies can survive
     # fusion and reranking together.
-    candidate_limit = 15 if multi_document_query and not document_name else 10
-    rerank_limit = 8 if multi_document_query and not document_name else 5
+
+    candidate_limit = (
+        15
+        if multi_document_query
+        and not document_name
+        else 10
+    )
+
+    rerank_limit = (
+        8
+        if multi_document_query
+        and not document_name
+        else 5
+    )
 
     # --------------------------------------------------------
     # STEP 1: QUERY REWRITING
     # --------------------------------------------------------
 
-    print("\n[1/7] Rewriting query...")
+    print(
+        "\n[1/7] Rewriting query..."
+    )
 
     rewritten_query = rewrite_query(
         query,
         conversation_history,
     )
 
-    print("\nOriginal query:")
-    print(query)
+    print(
+        "\nOriginal query:"
+    )
 
-    print("\nRewritten search query:")
-    print(rewritten_query)
+    print(
+        query
+    )
+
+    print(
+        "\nRewritten search query:"
+    )
+
+    print(
+        rewritten_query
+    )
 
     # --------------------------------------------------------
     # STEP 2: SEMANTIC SEARCH
     # --------------------------------------------------------
 
-    print("\n[2/7] Running semantic search...")
+    print(
+        "\n[2/7] Running semantic search..."
+    )
 
     semantic_results = semantic_search(
         rewritten_query,
@@ -237,7 +395,9 @@ def retrieve_evidence(
     # STEP 3: BM25 SEARCH
     # --------------------------------------------------------
 
-    print("\n[3/7] Running BM25 search...")
+    print(
+        "\n[3/7] Running BM25 search..."
+    )
 
     bm25_results = bm25_search(
         rewritten_query,
@@ -266,7 +426,9 @@ def retrieve_evidence(
         chunks,
     )
 
-    hybrid_results = hybrid_results[:candidate_limit]
+    hybrid_results = hybrid_results[
+        :candidate_limit
+    ]
 
     print(
         f"Hybrid retrieval candidates: "
@@ -277,7 +439,9 @@ def retrieve_evidence(
     # STEP 5: RERANKING
     # --------------------------------------------------------
 
-    print("\n[5/7] Reranking results...")
+    print(
+        "\n[5/7] Reranking results..."
+    )
 
     reranked_results = rerank_results(
         rewritten_query,
@@ -298,9 +462,11 @@ def retrieve_evidence(
         "\n[6/7] Verifying evidence support..."
     )
 
-    verified_results, verification_status = verify_evidence(
-        rewritten_query,
-        reranked_results,
+    verified_results, verification_status = (
+        verify_evidence(
+            rewritten_query,
+            reranked_results,
+        )
     )
 
     print(
@@ -331,17 +497,22 @@ def retrieve_evidence(
 
     confidence_abstained = (
         verification_status == VERIFIED
-        and confidence["score"] < CONFIDENCE_THRESHOLD
+        and confidence["score"]
+        < CONFIDENCE_THRESHOLD
     )
 
     coverage_abstained = (
         multi_document_query
         and verification_status == VERIFIED
-        and not confidence["coverage_sufficient"]
+        and not confidence[
+            "coverage_sufficient"
+        ]
     )
 
     final_abstained = (
-        verification_status != VERIFIED or confidence_abstained or coverage_abstained
+        verification_status != VERIFIED
+        or confidence_abstained
+        or coverage_abstained
     )
 
     print(
@@ -376,24 +547,49 @@ def display_results(
 ):
 
     print("\n")
-    print("=" * 75)
-    print("                    RETRIEVAL RESULTS")
-    print("=" * 75)
 
-    print("\nOriginal Question:")
-    print(original_query)
+    print(
+        "=" * 75
+    )
 
-    print("\nRewritten Search Query:")
-    print(rewritten_query)
+    print(
+        "                    RETRIEVAL RESULTS"
+    )
 
-    print("\nDocument Filter:")
+    print(
+        "=" * 75
+    )
+
+    print(
+        "\nOriginal Question:"
+    )
+
+    print(
+        original_query
+    )
+
+    print(
+        "\nRewritten Search Query:"
+    )
+
+    print(
+        rewritten_query
+    )
+
+    print(
+        "\nDocument Filter:"
+    )
+
     print(
         document_name
         if document_name
         else "All Documents"
     )
 
-    print("\nRetrieval Confidence:")
+    print(
+        "\nRetrieval Confidence:"
+    )
+
     print(
         f"{confidence['score']:.1f}% - "
         f"{confidence['level']}"
@@ -405,22 +601,34 @@ def display_results(
         f"{confidence['reranked_count']}"
     )
 
-    print("\n" + "-" * 75)
-    print("VERIFIED TOP EVIDENCE")
-    print("-" * 75)
+    print(
+        "\n" + "-" * 75
+    )
+
+    print(
+        "VERIFIED TOP EVIDENCE"
+    )
+
+    print(
+        "-" * 75
+    )
 
     for rank, result in enumerate(
         results,
         start=1,
     ):
 
-        chunk = result["chunk"]
+        chunk = result[
+            "chunk"
+        ]
 
         print(
             f"\nRESULT #{rank}"
         )
 
-        print("-" * 75)
+        print(
+            "-" * 75
+        )
 
         print(
             f"Document      : "
@@ -452,13 +660,17 @@ def display_results(
             f"{result.get('rerank_score', 0):.4f}"
         )
 
-        print("\nEvidence:")
+        print(
+            "\nEvidence:"
+        )
 
         print(
             chunk.get("text")
         )
 
-    print("\n" + "=" * 75)
+    print(
+        "\n" + "=" * 75
+    )
 
 
 # ============================================================
@@ -489,25 +701,12 @@ def main():
     # --------------------------------------------------------
     # SAMPLE CONVERSATION HISTORY
     # --------------------------------------------------------
-    #
-    # This demonstrates conversational query rewriting.
-    #
-    # Previous:
-    # User: How many annual leave days do employees get?
-    #
-    # Follow-up:
-    # What about interns?
-    #
-    # Rewriter should convert it into a standalone query.
-    # --------------------------------------------------------
 
     conversation_history = [
-
         "User: How many annual leave days do employees get?",
 
         "Assistant: Eligible full-time employees receive "
         "18 days of annual leave per calendar year.",
-
     ]
 
     # --------------------------------------------------------
@@ -564,27 +763,51 @@ def main():
 
     if verification_status == "verifier_unavailable":
 
-        print("\nEvidence verification is temporarily unavailable.")
-        print("No unverified answer was generated.")
+        print(
+            "\nEvidence verification is temporarily unavailable."
+        )
+
+        print(
+            "No unverified answer was generated."
+        )
+
         return
 
     if abstained:
 
-        print("\n" + "=" * 75)
-        print("                         FINAL ANSWER")
-        print("=" * 75)
+        print(
+            "\n" + "=" * 75
+        )
 
-        print("\nQuestion:")
-        print(query)
+        print(
+            "                         FINAL ANSWER"
+        )
 
-        print("\nDocument Filter:")
+        print(
+            "=" * 75
+        )
+
+        print(
+            "\nQuestion:"
+        )
+
+        print(
+            query
+        )
+
+        print(
+            "\nDocument Filter:"
+        )
+
         print(
             document_name
             if document_name
             else "All Documents"
         )
 
-        print("\nAnswer:")
+        print(
+            "\nAnswer:"
+        )
 
         print(
             "The information is not available in the "
@@ -602,14 +825,21 @@ def main():
             f"{CONFIDENCE_THRESHOLD:.1f}%"
         )
 
-        print("\n\nSOURCES")
-        print("-" * 50)
+        print(
+            "\n\nSOURCES"
+        )
+
+        print(
+            "-" * 50
+        )
 
         print(
             "No verified supporting sources available."
         )
 
-        print("\n" + "=" * 75)
+        print(
+            "\n" + "=" * 75
+        )
 
         return
 
@@ -651,19 +881,29 @@ def main():
 
     print("\n")
 
-    print("=" * 75)
+    print(
+        "=" * 75
+    )
 
     print(
         "                         FINAL ANSWER"
     )
 
-    print("=" * 75)
+    print(
+        "=" * 75
+    )
 
-    print("\nQuestion:")
+    print(
+        "\nQuestion:"
+    )
 
-    print(query)
+    print(
+        query
+    )
 
-    print("\nDocument Filter:")
+    print(
+        "\nDocument Filter:"
+    )
 
     print(
         document_name
@@ -671,9 +911,13 @@ def main():
         else "All Documents"
     )
 
-    print("\nAnswer:")
+    print(
+        "\nAnswer:"
+    )
 
-    print(answer)
+    print(
+        answer
+    )
 
     print(
         f"\nRetrieval Confidence: "
@@ -690,15 +934,21 @@ def main():
     # SOURCE ATTRIBUTION
     # --------------------------------------------------------
 
-    print("\nSOURCES")
+    print(
+        "\nSOURCES"
+    )
 
-    print("-" * 75)
+    print(
+        "-" * 75
+    )
 
     seen_sources = set()
 
     for result in results:
 
-        chunk = result["chunk"]
+        chunk = result[
+            "chunk"
+        ]
 
         source = (
             chunk.get("document_name"),
@@ -709,7 +959,9 @@ def main():
         if source in seen_sources:
             continue
 
-        seen_sources.add(source)
+        seen_sources.add(
+            source
+        )
 
         print(
             f"{len(seen_sources)}. "
@@ -724,13 +976,17 @@ def main():
             "No verified supporting sources available."
         )
 
-    print("\n" + "=" * 75)
+    print(
+        "\n" + "=" * 75
+    )
 
     print(
         "Complete RAG pipeline finished successfully."
     )
 
-    print("=" * 75)
+    print(
+        "=" * 75
+    )
 
 
 # ============================================================
@@ -738,5 +994,4 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
-
     main()
